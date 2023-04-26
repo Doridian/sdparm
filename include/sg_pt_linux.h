@@ -118,6 +118,7 @@ struct sg_pt_linux_scsi {
     bool is_sg;
     bool is_bsg;
     bool is_nvme;       /* OS device type, if false ignore nvme_our_sntl */
+    bool is_megaraid;
     bool nvme_our_sntl; /* true: our SNTL; false: received NVMe command */
     bool nvme_stat_dnr; /* Do No Retry, part of completion status field */
     bool nvme_stat_more; /* More, part of completion status field */
@@ -136,6 +137,8 @@ struct sg_pt_linux_scsi {
                                  * The whole 16 byte completion q entry is
                                  * sent back as sense data */
     uint32_t mdxfer_len;
+    uint16_t megaraid_controller_id;
+    uint8_t megaraid_disk_id;
     struct sg_sntl_dev_state_t dev_stat;
     void * mdxferp;
     uint8_t * nvme_id_ctlp;     /* cached response to controller IDENTIFY */

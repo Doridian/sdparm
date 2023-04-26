@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <string.h>
 #include <ctype.h>
 #include <unistd.h>
@@ -39,6 +40,7 @@
 #include "sg_pt_linux.h"
 #include "sg_pr2serr.h"
 
+#include "megaraid.h"
 
 #ifdef major
 #define SG_DEV_MAJOR major
@@ -52,6 +54,8 @@
 #ifndef BLOCK_EXT_MAJOR
 #define BLOCK_EXT_MAJOR 259     /* used by NVMe block devices */
 #endif
+
+#define MEGARAID_MAJOR 240
 
 #define DEF_TIMEOUT 60000       /* 60,000 millisecs (60 seconds) */
 
@@ -190,7 +194,7 @@ sg_find_bsg_nvme_char_major(int verbose)
  * If yields *nsid_p > 0 then dev_fd is a NVMe block device. */
 static bool
 check_file_type(int dev_fd, struct stat * dev_statp, bool * is_bsg_p,
-                bool * is_nvme_p, uint32_t * nsid_p, int * os_err_p,
+                bool * is_nvme_p, bool * is_megaraid_p, uint32_t * nsid_p, int * os_err_p,
                 int verbose)
 {
     bool is_nvme = false;
@@ -199,6 +203,7 @@ check_file_type(int dev_fd, struct stat * dev_statp, bool * is_bsg_p,
     bool is_bsg = false;
     bool is_char = false;
     bool is_block = false;
+    bool is_megaraid = false;
     int os_err = 0;
     int major_num;
     uint32_t nsid = 0;          /* invalid NSID */
@@ -225,6 +230,8 @@ check_file_type(int dev_fd, struct stat * dev_statp, bool * is_bsg_p,
                     is_bsg = true;
                 else if (sg_nvme_char_major == major_num)
                     is_nvme = true;
+                else if (MEGARAID_MAJOR == major_num)
+                    is_megaraid = true;
                 else if (sg_nvme_gen_char_major == major_num) {
                     is_nvme_gen = true;
                     nsid = ioctl(dev_fd, NVME_IOCTL_ID, NULL);
@@ -277,6 +284,8 @@ skip_out:
             pr2ws("block device\n");
         else if (is_char)
             pr2ws("character device\n");
+        else if (is_megaraid)
+            pr2ws("megaraid device\n");
         else
             pr2ws("undetermined device, could be regular file\n");
     }
@@ -284,6 +293,8 @@ skip_out:
         *is_bsg_p = is_bsg;
     if (is_nvme_p)
         *is_nvme_p = is_nvme | is_nvme_gen;
+    if (is_megaraid_p)
+        *is_megaraid_p = is_megaraid;
     if (nsid_p)
         *nsid_p = nsid;
     if (os_err_p)
@@ -307,12 +318,12 @@ check_pt_file_handle(int dev_fd, const char * device_name, int verbose)
               device_name);
     /* Linux doesn't need device_name to determine which pass-through */
     if (dev_fd >= 0) {
-        bool is_sg, is_bsg, is_nvme;
+        bool is_sg, is_bsg, is_nvme, is_megaraid;
         int err;
         uint32_t nsid;
         struct stat a_stat;
 
-        is_sg = check_file_type(dev_fd, &a_stat, &is_bsg, &is_nvme, &nsid,
+        is_sg = check_file_type(dev_fd, &a_stat, &is_bsg, &is_nvme, &is_megaraid, &nsid,
                                 &err, verbose);
         if (err)
             return -err;
@@ -324,6 +335,8 @@ check_pt_file_handle(int dev_fd, const char * device_name, int verbose)
             return 3;
         else if (is_nvme)
             return 4;
+        else if (is_megaraid)
+            return 5;
         else
             return 0;
     } else
@@ -422,6 +435,15 @@ construct_scsi_pt_obj_with_fd(int dev_fd, int verbose)
     if (ptp) {
         int err;
 
+    const char* env = getenv("MEGARAID_CONTROLLER_ID");
+    if (env) {
+        ptp->megaraid_controller_id = atoi(env);
+    }
+    env = getenv("MEGARAID_DISK_ID");
+    if (env) {
+        ptp->megaraid_disk_id = atoi(env);
+    }
+
 #if (HAVE_NVME && (! IGNORE_NVME))
         sntl_init_dev_stat(&ptp->dev_stat);
         if (! checked_ev_dsense) {
@@ -478,15 +500,20 @@ clear_scsi_pt_obj(struct sg_pt_base * vp)
     struct sg_pt_linux_scsi * ptp = &vp->impl;
 
     if (ptp) {
-        bool is_sg, is_bsg, is_nvme;
+        bool is_sg, is_bsg, is_nvme, is_megaraid;
         int fd;
         uint32_t nvme_nsid;
+        uint16_t megaraid_controller_id;
+        uint8_t megaraid_disk_id;
         struct sg_sntl_dev_state_t dev_stat;
 
         fd = ptp->dev_fd;
         is_sg = ptp->is_sg;
         is_bsg = ptp->is_bsg;
         is_nvme = ptp->is_nvme;
+        is_megaraid = ptp->is_megaraid;
+        megaraid_controller_id =  ptp->megaraid_controller_id;
+        megaraid_disk_id =  ptp->megaraid_disk_id;
         nvme_nsid = ptp->nvme_nsid;
         dev_stat = ptp->dev_stat;
         if (ptp->free_nvme_id_ctlp)
@@ -506,6 +533,9 @@ clear_scsi_pt_obj(struct sg_pt_base * vp)
         ptp->nvme_our_sntl = false;
         ptp->nvme_nsid = nvme_nsid;
         ptp->dev_stat = dev_stat;
+        ptp->is_megaraid = is_megaraid;
+        ptp->megaraid_controller_id = megaraid_controller_id;
+        ptp->megaraid_disk_id = megaraid_disk_id;
     }
 }
 
@@ -571,7 +601,7 @@ set_pt_file_handle(struct sg_pt_base * vp, int dev_fd, int verbose)
     ptp->dev_fd = dev_fd;
     if (dev_fd >= 0) {
         ptp->is_sg = check_file_type(dev_fd, &a_stat, &ptp->is_bsg,
-                                     &ptp->is_nvme, &ptp->nvme_nsid,
+                                     &ptp->is_nvme, &ptp->is_megaraid, &ptp->nvme_nsid,
                                      &ptp->os_err, verbose);
         if (ptp->is_sg && (! sg_checked_version_num)) {
             if (ioctl(dev_fd, SG_GET_VERSION_NUM, &ptp->sg_version) < 0) {
@@ -1056,6 +1086,98 @@ get_pt_nvme_nsid(const struct sg_pt_base * vp)
     return ptp->nvme_nsid;
 }
 
+/* Executes SCSI command using sg MegaSAS interface */
+static int
+do_scsi_pt_megasas(struct sg_pt_linux_scsi * ptp, int fd, int time_secs,
+              int verbose)
+{
+    int dxfer_len = 0;
+    void* dxferp = NULL;
+    struct megasas_iocpacket      uio;
+    struct megasas_pthru_frame    *pthru;
+
+    memset(&uio, 0, sizeof(uio));
+    pthru = &uio.frame.pthru;
+    pthru->cmd = MFI_CMD_PD_SCSI_IO;
+    pthru->flags = MFI_FRAME_DIR_NONE;
+    pthru->cmd_status = 0xFF;
+    pthru->scsi_status = 0x0;
+    pthru->target_id = ptp->megaraid_disk_id;
+    pthru->lun = 0;
+    pthru->cdb_len = ptp->io_hdr.request_len;
+    pthru->timeout = time_secs;
+
+    if (ptp->io_hdr.din_xfer_len > 0) {
+        if (ptp->io_hdr.dout_xfer_len > 0) {
+            if (verbose)
+                pr2ws("megasas doesn't support bidi\n");
+            return SCSI_PT_DO_BAD_PARAMS;
+        }
+        dxferp = (void *)(long)ptp->io_hdr.din_xferp;
+        dxfer_len = (unsigned int)ptp->io_hdr.din_xfer_len;
+        pthru->flags = MFI_FRAME_DIR_READ;
+    } else if (ptp->io_hdr.dout_xfer_len > 0) {
+        dxferp = (void *)(long)ptp->io_hdr.dout_xferp;
+        dxfer_len = (unsigned int)ptp->io_hdr.dout_xfer_len;
+        pthru->flags = MFI_FRAME_DIR_WRITE;
+    }
+
+    if (NULL == (void*)(sg_uintptr_t)ptp->io_hdr.request) {
+        if (verbose)
+            pr2ws("No SCSI command (cdb) given [megasas]\n");
+        return SCSI_PT_DO_BAD_PARAMS;
+    }
+
+    if (dxfer_len > 0) {
+        pthru->sge_count = 1;
+        pthru->data_xfer_len = dxfer_len;
+        pthru->sgl.sge32[0].phys_addr = (intptr_t)dxferp;
+        pthru->sgl.sge32[0].length = (uint32_t)dxfer_len;
+    }
+    memcpy(pthru->cdb, (void*)(sg_uintptr_t)ptp->io_hdr.request, ptp->io_hdr.request_len);
+
+    uio.host_no = ptp->megaraid_controller_id;
+    if (dxfer_len > 0) {
+        uio.sge_count = 1;
+        uio.sgl_off = offsetof(struct megasas_pthru_frame, sgl);
+        uio.sgl[0].iov_base = dxferp;
+        uio.sgl[0].iov_len = dxfer_len;
+    }
+
+    errno = 0;
+    int rc = ioctl(fd, MEGASAS_IOC_FIRMWARE, &uio);
+    if (rc != 0) {
+        ptp->os_err = errno;
+        return -ptp->os_err;
+    }
+
+    switch (pthru->cmd_status) {
+        case MFI_STAT_OK:
+            ptp->io_hdr.transport_status = 0x00; // DID_OK
+            break;
+        case MFI_STAT_DEVICE_NOT_FOUND:
+            ptp->io_hdr.transport_status = 0x04; // DID_BAD_TARGET
+            break;
+        default:
+            ptp->io_hdr.transport_status = pthru->cmd_status | 0xFF00; // DID_ERROR
+            break;
+    }
+
+    ptp->io_hdr.device_status = (__u32)pthru->scsi_status;
+    ptp->io_hdr.driver_status = 0;
+    ptp->io_hdr.response_len = (__u32)pthru->sense_len;
+    ptp->io_hdr.duration = 0;
+
+    const __s32 resid = dxfer_len - (__u32)pthru->data_xfer_len;
+    if (pthru->flags == MFI_FRAME_DIR_READ) {
+        ptp->io_hdr.din_resid = resid;
+    } else {
+        ptp->io_hdr.dout_resid = resid;
+    }
+
+    return 0;
+}
+
 /* Executes SCSI command using sg v3 interface */
 static int
 do_scsi_pt_v3(struct sg_pt_linux_scsi * ptp, int fd, int time_secs,
@@ -1177,8 +1299,8 @@ do_scsi_pt(struct sg_pt_base * vp, int fd, int time_secs, int verbose)
     if (ptp->os_err)
         return -ptp->os_err;
     if (verbose > 5)
-        pr2ws("%s:  is_nvme=%d, is_sg=%d, is_bsg=%d\n", __func__,
-              (int)ptp->is_nvme, (int)ptp->is_sg, (int)ptp->is_bsg);
+        pr2ws("%s:  is_nvme=%d, is_sg=%d, is_bsg=%d, is_megaraid=%d\n", __func__,
+              (int)ptp->is_nvme, (int)ptp->is_sg, (int)ptp->is_bsg, (int)ptp->is_megaraid);
     if (ptp->is_nvme)
         return sg_do_nvme_pt(vp, -1, time_secs, verbose);
     else if (ptp->is_sg) {
@@ -1194,6 +1316,8 @@ do_scsi_pt(struct sg_pt_base * vp, int fd, int time_secs, int verbose)
         return do_scsi_pt_v3(ptp, fd, time_secs, verbose);
     else if (ptp->is_bsg)
         return do_scsi_pt_v4(ptp, fd, time_secs, verbose);
+    else if (ptp->is_megaraid)
+        return do_scsi_pt_megasas(ptp, fd, time_secs, verbose);
     else
         return do_scsi_pt_v3(ptp, fd, time_secs, verbose);
 
